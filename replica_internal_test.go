@@ -644,7 +644,7 @@ func TestReplica_Follow_PartialProgressOnCancellation(t *testing.T) {
 		return nil, context.Canceled
 	}
 	r := NewReplicaWithClient(nil, client)
-	if err := r.follow(ctx, f.Name(), 10, time.Millisecond); err != nil {
+	if err := r.follow(ctx, f.Name(), 10, time.Millisecond, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := ReadTXIDFile(f.Name()); err != nil || got != 11 {
@@ -714,7 +714,7 @@ func TestReplica_Follow_RetryPartialProgress(t *testing.T) {
 			db := NewDB(f.Name())
 			db.Logger = slog.New(slog.NewTextHandler(&logs, nil))
 			r := NewReplicaWithClient(db, client)
-			err := r.follow(ctx, f.Name(), 10, time.Millisecond)
+			err := r.follow(ctx, f.Name(), 10, time.Millisecond, nil)
 			if failSidecar {
 				if err == nil || !strings.Contains(err.Error(), "write txid file") {
 					t.Fatalf("expected sidecar error, got %v", err)
