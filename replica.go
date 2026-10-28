@@ -652,8 +652,20 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 				if latestSnapshot.MinTXID > txid {
 					return fmt.Errorf("cannot resume follow mode: saved TXID %s is behind the earliest snapshot (min TXID %s); replica history has been pruned -- delete %s and %s-txid to re-restore", txid, latestSnapshot.MinTXID, opt.OutputPath, opt.OutputPath)
 				}
-				if txid > latestSnapshot.MaxTXID {
-					return fmt.Errorf("cannot resume follow mode: saved TXID %s is ahead of latest snapshot (max TXID %s); delete %s and %s-txid to re-restore", txid, latestSnapshot.MaxTXID, opt.OutputPath, opt.OutputPath)
+
+				// A follow file legitimately runs ahead of the latest snapshot, so bound the check by the newest TXID across all levels.
+				var maxTXID ltx.TXID
+				for level := 0; level <= SnapshotLevel; level++ {
+					info, infoErr := r.MaxLTXFileInfo(ctx, level)
+					if infoErr != nil {
+						return fmt.Errorf("cannot validate saved TXID for crash recovery: %w", infoErr)
+					}
+					if info.MaxTXID > maxTXID {
+						maxTXID = info.MaxTXID
+					}
+				}
+				if txid > maxTXID {
+					return fmt.Errorf("cannot resume follow mode: saved TXID %s is ahead of the replica's latest TXID %s; delete %s and %s-txid to re-restore", txid, maxTXID, opt.OutputPath, opt.OutputPath)
 				}
 			}
 
@@ -838,15 +850,6 @@ func (r *Replica) follow(ctx context.Context, outputPath string, lastTXID ltx.TX
 			return nil
 		case <-ticker.C:
 			newTXID, err := r.applyNewLTXFiles(ctx, f, lastTXID, pageSize)
-			if err != nil {
-				if ctx.Err() != nil {
-					r.Logger().Info("follow mode stopped")
-					return nil
-				}
-				consecutiveErrors++
-				r.Logger().Error("follow: error applying updates", "err", err, "consecutive_errors", consecutiveErrors)
-				continue
-			}
 			if newTXID > lastTXID {
 				if err := WriteTXIDFile(outputPath, newTXID); err != nil {
 					return fmt.Errorf("write txid file: %w", err)
@@ -854,6 +857,15 @@ func (r *Replica) follow(ctx context.Context, outputPath string, lastTXID ltx.TX
 				r.Logger().Info("follow: applied updates", "from_txid", lastTXID, "to_txid", newTXID)
 				lastTXID = newTXID
 				consecutiveErrors = 0
+			}
+			if err != nil {
+				if ctx.Err() != nil {
+					r.Logger().Info("follow mode stopped")
+					return nil
+				}
+				consecutiveErrors++
+				r.Logger().Warn("follow: error applying updates", "err", err, "consecutive_errors", consecutiveErrors)
+				continue
 			}
 		}
 	}
@@ -889,10 +901,10 @@ func (r *Replica) applyNewLTXFiles(ctx context.Context, f *os.File, afterTXID lt
 		// If there's a gap, try to fill it from higher compaction levels.
 		if info.MinTXID > currentTXID+1 {
 			bridgedTXID, err := r.fillFollowGap(ctx, f, currentTXID, info.MinTXID, pageSize)
+			currentTXID = bridgedTXID
 			if err != nil {
 				return closeLevel0(err)
 			}
-			currentTXID = bridgedTXID
 
 			// Re-check if this file is still needed after bridging.
 			if info.MaxTXID <= currentTXID {
@@ -926,10 +938,10 @@ func (r *Replica) applyNewLTXFiles(ctx context.Context, f *os.File, afterTXID lt
 
 	if !sawLevel0 {
 		bridgedTXID, err := r.fillFollowGap(ctx, f, currentTXID, currentTXID+1, pageSize)
+		currentTXID = bridgedTXID
 		if err != nil {
 			return currentTXID, err
 		}
-		currentTXID = bridgedTXID
 	}
 
 	return currentTXID, nil
