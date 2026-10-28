@@ -611,6 +611,8 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		return fmt.Errorf("output path required")
 	} else if opt.TXID != 0 && !opt.Timestamp.IsZero() {
 		return fmt.Errorf("cannot specify index & timestamp to restore")
+	} else if opt.OnApplied != nil && !opt.Follow {
+		return fmt.Errorf("OnApplied requires follow mode")
 	} else if opt.Follow && opt.TXID != 0 {
 		return fmt.Errorf("cannot use follow mode with -txid")
 	} else if opt.Follow && !opt.Timestamp.IsZero() {
@@ -623,6 +625,9 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	// by reading the last applied TXID from the sidecar file.
 	if opt.Follow {
 		if _, statErr := os.Stat(opt.OutputPath); statErr == nil {
+			if opt.OnApplied != nil {
+				return fmt.Errorf("OnApplied requires a fresh working database; discard existing output before restarting")
+			}
 			txid, readErr := ReadTXIDFile(opt.OutputPath)
 			if readErr != nil {
 				return fmt.Errorf("read txid file for crash recovery: %w", readErr)
@@ -670,7 +675,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 			}
 
 			r.Logger().Info("resuming follow mode from crash recovery", "txid", txid, "output", opt.OutputPath)
-			return r.follow(ctx, opt.OutputPath, txid, opt.FollowInterval)
+			return r.follow(ctx, opt.OutputPath, txid, opt.FollowInterval, nil)
 		}
 	}
 
@@ -804,7 +809,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		if err := WriteTXIDFile(opt.OutputPath, maxTXID); err != nil {
 			return fmt.Errorf("write initial txid file: %w", err)
 		}
-		return r.follow(ctx, opt.OutputPath, maxTXID, opt.FollowInterval)
+		return r.follow(ctx, opt.OutputPath, maxTXID, opt.FollowInterval, opt.OnApplied)
 	}
 
 	return nil
@@ -813,7 +818,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 // follow enters a continuous restore loop, polling for new LTX files and
 // applying them to the restored database. It blocks until the context is
 // cancelled (e.g. Ctrl+C). Returns nil on clean shutdown.
-func (r *Replica) follow(ctx context.Context, outputPath string, lastTXID ltx.TXID, interval time.Duration) error {
+func (r *Replica) follow(ctx context.Context, outputPath string, lastTXID ltx.TXID, interval time.Duration, onApplied func(context.Context, string, ltx.TXID) error) error {
 	f, err := os.OpenFile(outputPath, os.O_RDWR, 0)
 	if err != nil {
 		return fmt.Errorf("open database for follow: %w", err)
@@ -822,6 +827,12 @@ func (r *Replica) follow(ctx context.Context, outputPath string, lastTXID ltx.TX
 		_ = f.Sync()
 		_ = f.Close()
 	}()
+
+	if onApplied != nil {
+		if err := onApplied(ctx, outputPath, lastTXID); err != nil {
+			return fmt.Errorf("initial handoff: %w", err)
+		}
+	}
 
 	// Read page size from SQLite header (offset 16, 2 bytes, big-endian).
 	var buf [2]byte
@@ -850,9 +861,20 @@ func (r *Replica) follow(ctx context.Context, outputPath string, lastTXID ltx.TX
 			return nil
 		case <-ticker.C:
 			newTXID, err := r.applyNewLTXFiles(ctx, f, lastTXID, pageSize)
+			// No callback or retry after a partial pass. A later retry could still
+			// contain pages from an incompletely applied transaction.
+			if err != nil && onApplied != nil {
+				return fmt.Errorf("follow session must be rebuilt: %w", err)
+			}
+
 			if newTXID > lastTXID {
 				if err := WriteTXIDFile(outputPath, newTXID); err != nil {
 					return fmt.Errorf("write txid file: %w", err)
+				}
+				if onApplied != nil {
+					if err := onApplied(ctx, outputPath, newTXID); err != nil {
+						return fmt.Errorf("handoff: %w", err)
+					}
 				}
 				r.Logger().Info("follow: applied updates", "from_txid", lastTXID, "to_txid", newTXID)
 				lastTXID = newTXID

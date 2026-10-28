@@ -3471,6 +3471,17 @@ type RestoreOptions struct {
 	// FollowInterval specifies how often to poll for new LTX files in follow mode.
 	FollowInterval time.Duration
 
+	// OnApplied runs synchronously after bootstrap and each successful follow
+	// apply pass. No further writes occur until it returns, so it may copy the
+	// database to a separate immutable file. It must not modify the working file
+	// or leave readers on it after returning. The callback may coalesce updates;
+	// it does not run once per source transaction.
+	//
+	// Requires Follow and a fresh OutputPath. Apply and callback errors end the
+	// session; discard the working database before restarting. Without this
+	// option, ordinary follow retry and resume behavior is unchanged.
+	OnApplied func(context.Context, string, ltx.TXID) error
+
 	// IntegrityCheck specifies the level of integrity checking after restore.
 	// Zero value (IntegrityCheckNone) skips the check for backward compatibility.
 	IntegrityCheck IntegrityCheckMode
